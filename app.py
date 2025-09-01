@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -9,7 +10,7 @@ import streamlit as st
 
 st.set_page_config(page_title="AI Crawler Access Tester", page_icon="🤖", layout="wide")
 
-# ---- Known AI crawler User-Agents (you can edit/extend) ----
+# ---- Known AI crawler User-Agents ----
 CRAWLER_UAS: Dict[str, str] = {
     "GPTBot": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.0; +https://openai.com/gptbot)",
     "ChatGPT-User": "Mozilla/5.0 (compatible; ChatGPT-User; +https://openai.com/bot)",
@@ -24,6 +25,7 @@ CRAWLER_UAS: Dict[str, str] = {
 
 BLOCK_STATUS = {401, 403, 405, 406, 409, 410, 429, 451}
 
+
 @dataclass
 class FetchResult:
     crawler: str
@@ -36,23 +38,22 @@ class FetchResult:
     headers: Dict[str, str]
     body_sample: str
 
+
 def normalize_url(u: str) -> str:
     u = u.strip()
     if not u:
         return u
     parsed = urlparse(u, scheme="https")
-    # If user entered "example.com" add scheme
-    if not parsed.netloc and parsed.path:
+    if not parsed.netloc and parsed.path:  # allow bare domains
         return f"https://{parsed.path}"
     return parsed.geturl()
 
+
 def classify_block(status: int, body_text: str, headers: Dict[str, str]) -> Tuple[str, str]:
-    text = (body_text or "")[:2000]  # limit scan
-    lower = text.lower()
+    text = (body_text or "")[:2000].lower()
     if status in BLOCK_STATUS:
         return ("true", f"HTTP {status}")
-    # Heuristics for bot challenges
-    if any(k in lower for k in [
+    if any(k in text for k in [
         "access denied", "forbidden", "not authorized", "verify you are human",
         "cloudflare", "akamai", "perimeterx", "attention required"
     ]):
@@ -61,9 +62,11 @@ def classify_block(status: int, body_text: str, headers: Dict[str, str]) -> Tupl
         return ("false", "x-robots-tag present (informational)")
     return ("false", "OK")
 
-async def fetch_once(client: httpx.AsyncClient, url: str, ua: str, method: str) -> Tuple[int, str, Dict[str, str], str]:
+
+async def fetch_once(client: httpx.AsyncClient, url: str, ua: str, method: str):
     r = await client.request(
-        method, url, headers={
+        method, url,
+        headers={
             "user-agent": ua,
             "accept": "*/*",
             "accept-language": "en",
@@ -71,15 +74,10 @@ async def fetch_once(client: httpx.AsyncClient, url: str, ua: str, method: str) 
         }
     )
     body = await r.aread() if method == "GET" else b""
-    # Convert headers to str -> str
     headers = {k: ", ".join(v) if isinstance(v, list) else str(v) for k, v in r.headers.items()}
-    body_text = ""
-    # Best-effort decode as text
-    try:
-        body_text = body.decode("utf-8", errors="ignore")
-    except Exception:
-        body_text = ""
-    return (r.status_code, str(r.url), headers, body_text)
+    body_text = body.decode("utf-8", errors="ignore") if body else ""
+    return r.status_code, str(r.url), headers, body_text
+
 
 async def test_crawler(url: str, crawler: str, ua: str, timeout_s: float = 15.0) -> FetchResult:
     url = normalize_url(url)
@@ -89,39 +87,22 @@ async def test_crawler(url: str, crawler: str, ua: str, timeout_s: float = 15.0)
     ) as client:
         try:
             with st.spinner(f"Testing {crawler}…"):
-                # HEAD first (some servers block HEAD; fallback to GET)
+                t0 = time.perf_counter()
                 try:
                     status, final_url, headers, body = await fetch_once(client, url, ua, "HEAD")
                     if status >= 400 or status == 405:
                         status, final_url, headers, body = await fetch_once(client, url, ua, "GET")
                 except httpx.HTTPError:
-                    # Directly try GET on transport errors
                     status, final_url, headers, body = await fetch_once(client, url, ua, "GET")
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
                 blocked, reason = classify_block(status, body, headers)
-                elapsed_ms = int(client._transport.handle_request.statistics().total_elapsed * 1000) if hasattr(client._transport, "handle_request") else 0
-                return FetchResult(
-                    crawler=crawler,
-                    input_url=url,
-                    final_url=final_url,
-                    status=status,
-                    blocked=blocked,
-                    reason=reason,
-                    elapsed_ms=elapsed_ms,
-                    headers=headers,
-                    body_sample=(body[:500] or "")
-                )
+                return FetchResult(crawler, url, final_url, status, blocked, reason,
+                                   elapsed_ms, headers, body[:500] or "")
         except Exception as e:
-            return FetchResult(
-                crawler=crawler,
-                input_url=url,
-                final_url=url,
-                status=0,
-                blocked="unknown",
-                reason=f"Fetch failed: {e}",
-                elapsed_ms=0,
-                headers={},
-                body_sample=""
-            )
+            return FetchResult(crawler, url, url, 0, "unknown", f"Fetch failed: {e}",
+                               0, {}, "")
+
 
 @st.cache_data(show_spinner=False, ttl=600)
 def fetch_robots_txt(base_url: str) -> Optional[str]:
@@ -136,20 +117,21 @@ def fetch_robots_txt(base_url: str) -> Optional[str]:
     except Exception as e:
         return f"(Error: {e})"
 
+
 # ---- UI ----
-st.title("🤖 AI Crawler Access Tester (Streamlit)")
-st.caption("Send requests with popular AI crawler User-Agents to see how your site responds. This tool does not *enforce* robots.txt; it inspects server responses.")
+st.title("🤖 AI Crawler Access Tester")
+st.caption("Send requests with popular AI crawler User-Agents to see how your site responds. "
+           "This tool does not *enforce* robots.txt; it inspects server responses.")
 
 with st.sidebar:
     st.header("Settings")
-    default_url = "https://example.com"
-    url = st.text_input("Website URL", value=default_url, placeholder="https://yoursite.com")
-    chosen_bots = st.multiselect("AI crawlers to simulate", list(CRAWLER_UAS.keys()), default=["GPTBot", "OAI-SearchBot"])
+    url = st.text_input("Website URL", value="https://example.com")
+    chosen_bots = st.multiselect("AI crawlers to simulate", list(CRAWLER_UAS.keys()),
+                                 default=["GPTBot", "OAI-SearchBot"])
     timeout = st.slider("Timeout (seconds)", 5, 30, 15)
     show_robots = st.checkbox("Show robots.txt (informational)", value=True)
     run_btn = st.button("Run tests", type="primary")
 
-# Initialize history
 if "history" not in st.session_state:
     st.session_state.history: List[Dict] = []
 
@@ -159,21 +141,20 @@ if run_btn:
     elif not chosen_bots:
         st.error("Pick at least one crawler.")
     else:
-        tasks = [test_crawler(url, b, CRAWLER_UAS[b], timeout) for b in chosen_bots]
-        results: List[FetchResult] = asyncio.run(asyncio.gather(*tasks))
+        coros = [test_crawler(url, b, CRAWLER_UAS[b], timeout) for b in chosen_bots]
 
-        # Append to history (flat dicts for tables/exports)
+        async def _run_all():
+            return await asyncio.gather(*coros)
+
+        results: List[FetchResult] = asyncio.run(_run_all())
         for r in results:
             st.session_state.history.append(asdict(r))
-
         st.success("Done!")
 
-# ---- Results / History ----
+# ---- Results ----
 if st.session_state.history:
     st.subheader("Results")
-    # Show most recent batch on top
     table_rows = list(reversed(st.session_state.history))
-    # Compact table
     st.dataframe(
         [{
             "Crawler": r["crawler"],
@@ -182,16 +163,15 @@ if st.session_state.history:
             "HTTP": r["status"],
             "Blocked": r["blocked"],
             "Reason": r["reason"],
-            "Elapsed (ms)": r["elapsed_ms"]
+            "Elapsed (ms)": r["elapsed_ms"],
         } for r in table_rows],
         use_container_width=True,
         hide_index=True
     )
 
-    # Detailed per-result expanders
     st.divider()
     st.subheader("Details")
-    for r in table_rows[:20]:  # limit expanders for performance
+    for r in table_rows[:20]:
         with st.expander(f'{r["crawler"]} → {r["final_url"]} (HTTP {r["status"]}, blocked={r["blocked"]})'):
             cols = st.columns(3)
             with cols[0]:
@@ -205,25 +185,22 @@ if st.session_state.history:
                 st.write("**Response headers**")
                 st.json(r["headers"])
             with cols[2]:
-                st.write("**Body sample (first 500 chars)**")
+                st.write("**Body sample**")
                 st.code(r["body_sample"] or "(no body)")
 
-    # Exporters
     st.divider()
     st.subheader("Export")
-    csv_rows = table_rows
     csv_data = "crawler,input_url,final_url,status,blocked,reason,elapsed_ms\n" + "\n".join(
         f'{r["crawler"]},"{r["input_url"]}","{r["final_url"]}",{r["status"]},{r["blocked"]},"{r["reason"].replace(",", ";")}",{r["elapsed_ms"]}'
-        for r in csv_rows
+        for r in table_rows
     )
-    st.download_button("Download CSV", data=csv_data.encode("utf-8"), file_name="crawler_results.csv", mime="text/csv")
-
+    st.download_button("Download CSV", data=csv_data.encode("utf-8"),
+                       file_name="crawler_results.csv", mime="text/csv")
     json_data = json.dumps(table_rows, indent=2)
-    st.download_button("Download JSON", data=json_data.encode("utf-8"), file_name="crawler_results.json", mime="application/json")
+    st.download_button("Download JSON", data=json_data.encode("utf-8"),
+                       file_name="crawler_results.json", mime="application/json")
 
-# robots.txt (optional, informational)
 if show_robots and url.strip():
     st.divider()
     st.subheader("robots.txt (informational only)")
-    st.caption("Shown for context—this app does not interpret robots.txt to decide blocked/allowed.")
     st.code(fetch_robots_txt(url) or "(none)")
